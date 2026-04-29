@@ -1,0 +1,13 @@
+[gd_scene format=3 uid="uid://dt0qbw3prredt"]
+
+[ext_resource type="Script" uid="uid://drxbl50xjtwx2" path="res://scripts/pixel_painter.gd" id="1_r2w0x"]
+
+[node name="PixelPainter" type="Node2D" unique_id=2023129133]
+script = ExtResource("1_r2w0x")
+grid_width = null
+grid_height = null
+cell_size = null
+palette = null
+canvas_origin = null
+palette_origin = null
+palette_item_size = null
