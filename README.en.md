@@ -6,7 +6,7 @@ Great for:
 - Pixel character sketches
 - Fast reference-to-pixel conversion
 - Palette experiments and limited-color practice
-
+It is especially suitable for post-processing and style unification of AI-generated pixel art.
 ## Features
 
 - Multiple canvas sizes: `16x16` to `64x64`
