@@ -47,7 +47,7 @@ var clear_button: Button
 var export_button: Button
 var export_config_button: Button
 var import_config_button: Button
-var pick_image_button: Button
+var restore_button: Button
 var recommend_palette_button: Button
 var compose_sheet_button: Button
 var current_reference_image_path: String = REFERENCE_IMAGE_PATH
@@ -55,6 +55,16 @@ var analyze_pixels_button: Button
 var color_limit_label: Label
 var image_color_limit_spinbox: SpinBox
 var image_color_limit_max_button: Button
+var transparent_side_panel: PanelContainer
+var transparent_panel_title_label: Label
+var transparent_key_label: Label
+var transparent_key_swatch: ColorRect
+var transparent_tolerance_label: Label
+var transparent_tolerance_spinbox: SpinBox
+var transparent_apply_all_button: Button
+var transparent_rules_title_label: Label
+var transparent_rules_scroll: ScrollContainer
+var transparent_rules_flow: FlowContainer
 var merge_tolerance_label: Label
 var image_merge_tolerance_spinbox: SpinBox
 var language_toggle_button: Button
@@ -62,8 +72,18 @@ var frames_toggle_button: Button
 var offset_toggle_button: Button
 var suppress_image_color_limit_signal: bool = false
 var suppress_merge_tolerance_signal: bool = false
+var suppress_transparent_tolerance_signal: bool = false
 var image_merge_tolerance_percent: int = 0
 var current_language: String = LANG_ZH
+var transparent_tolerance_percent: float = 0.0
+var transparent_key_enabled: bool = false
+var transparent_key_color: Color = Color(1.0, 0.0, 1.0, 1.0)
+var transparent_manual_colors: Array[Color] = []
+var transparent_collected_colors: Array[Color] = []
+var transparent_state_by_frame: Dictionary = {}
+var committed_reference_source_image: Image
+var original_reference_source_image: Image
+var original_sprite_sheet_image: Image
 var sprite_sheet_file_dialog: FileDialog
 var frame_split_window: Window
 var frame_rows_label: Label
@@ -71,6 +91,7 @@ var frame_rows_spinbox: SpinBox
 var frame_cols_label: Label
 var frame_cols_spinbox: SpinBox
 var frame_apply_grid_button: Button
+var frame_single_button: Button
 var frame_crop_button: Button
 var frame_preview_texture_rect: TextureRect
 var frame_grid_overlay: Control
@@ -102,12 +123,17 @@ var ui_texts: Dictionary = {
 		"export_png": "导出PNG",
 		"export_cfg": "导出配置",
 		"import_cfg": "导入配置",
-		"pick_image": "选择图片像素化",
+		"restore": "还原",
 		"recommend": "推荐调色板",
-		"compose_sheet": "生成整图",
+		"compose_sheet": "生",
 		"analyze": "分析图像像素",
 		"limit": "限色:",
 		"limit_max": "最大",
+		"transparent_panel_title": "透明操作",
+		"transparent_key": "透明色:",
+		"transparent_tol": "透明宽容:",
+		"transparent_apply_all": "应用至所有帧",
+		"transparent_rules_title": "透明像素集合",
 		"tolerance": "宽容度:",
 		"lang_toggle": "EN",
 		"frames_toggle": "帧",
@@ -119,6 +145,7 @@ var ui_texts: Dictionary = {
 		"rows": "行:",
 		"cols": "列:",
 		"apply_grid": "应用网格切割",
+		"single_frame": "单帧",
 		"crop_image": "裁剪图片",
 		"start_hint": "像素画工具已启动。左键上色，右键擦除，中键拖动画布，滚轮缩放，数字键 1-9 选色，C 清空，E 或按钮导出 PNG。"
 	},
@@ -129,12 +156,17 @@ var ui_texts: Dictionary = {
 		"export_png": "ExportPNG",
 		"export_cfg": "SaveCfg",
 		"import_cfg": "LoadCfg",
-		"pick_image": "PickImage",
+		"restore": "Restore",
 		"recommend": "BestPal",
-		"compose_sheet": "Compose",
+		"compose_sheet": "Gen",
 		"analyze": "Analyze",
 		"limit": "Limit:",
 		"limit_max": "Max",
+		"transparent_panel_title": "Alpha Ops",
+		"transparent_key": "AlphaKey:",
+		"transparent_tol": "AlphaTol:",
+		"transparent_apply_all": "ApplyAll",
+		"transparent_rules_title": "Alpha Set",
 		"tolerance": "Tolerance:",
 		"lang_toggle": "中",
 		"frames_toggle": "FR",
@@ -146,6 +178,7 @@ var ui_texts: Dictionary = {
 		"rows": "Rows:",
 		"cols": "Cols:",
 		"apply_grid": "Apply Grid",
+		"single_frame": "Single",
 		"crop_image": "Crop Image",
 		"start_hint": "Pixel painter ready. Left paint, right erase, middle drag, wheel zoom, 1-9 pick color, C clear, E export PNG."
 	}
@@ -157,6 +190,9 @@ var canvas_pan: Vector2 = Vector2.ZERO
 var canvas_zoom: float = 1.0
 const CANVAS_ZOOM_MIN: float = 0.25
 const CANVAS_ZOOM_MAX: float = 8.0
+const UNDO_MAX_STEPS: int = 64
+var undo_stack: Array[Dictionary] = []
+var paint_stroke_active: bool = false
 
 
 func _ready() -> void:
@@ -180,6 +216,10 @@ func _unhandled_input(event: InputEvent) -> void:
 		var mouse_event := event as InputEventMouseButton
 		if mouse_event.button_index == MOUSE_BUTTON_LEFT and not mouse_event.pressed:
 			frame_offset_dragging = false
+			paint_stroke_active = false
+			return
+		if mouse_event.button_index == MOUSE_BUTTON_RIGHT and not mouse_event.pressed:
+			paint_stroke_active = false
 			return
 		if mouse_event.pressed:
 			if mouse_event.button_index == MOUSE_BUTTON_WHEEL_UP:
@@ -201,10 +241,16 @@ func _unhandled_input(event: InputEvent) -> void:
 				if _try_select_palette(mouse_event.position):
 					queue_redraw()
 					return
+				if _mouse_to_cell(mouse_event.position).x >= 0:
+					_begin_paint_stroke_snapshot()
 				_try_paint(mouse_event.position, selected_color_idx)
 			elif mouse_event.button_index == MOUSE_BUTTON_RIGHT:
+				if _try_set_transparent_key_from_palette(mouse_event.position):
+					return
 				if frame_offset_mode_active:
 					return
+				if _mouse_to_cell(mouse_event.position).x >= 0:
+					_begin_paint_stroke_snapshot()
 				_try_paint(mouse_event.position, -1)
 	elif event is InputEventMouseMotion:
 		var motion_event := event as InputEventMouseMotion
@@ -230,12 +276,14 @@ func _unhandled_input(event: InputEvent) -> void:
 			_try_paint(motion_event.position, -1)
 	elif event is InputEventKey and event.pressed and not event.echo:
 		var key_event := event as InputEventKey
-		if key_event.keycode == KEY_LEFT:
+		if key_event.ctrl_pressed and key_event.keycode == KEY_Z:
+			_undo_last_action()
+		elif key_event.keycode == KEY_LEFT:
 			_select_preview_frame_by_offset(-1)
 		elif key_event.keycode == KEY_RIGHT:
 			_select_preview_frame_by_offset(1)
 		elif key_event.keycode == KEY_C:
-			_clear_canvas()
+			_clear_canvas(true)
 		elif key_event.keycode == KEY_E:
 			_export_png()
 		else:
@@ -258,6 +306,17 @@ func _draw_palette() -> void:
 		var rect := Rect2(item_pos, Vector2(palette_item_size, palette_item_size))
 		draw_rect(rect, palette[i], true)
 		draw_rect(rect, Color(0.15, 0.15, 0.15), false, 2.0)
+		if _is_color_in_array(palette[i], transparent_collected_colors):
+			var key_rect := rect.grow(1.5)
+			draw_rect(key_rect, Color(0.2, 1.0, 0.35, 1.0), false, 2.0)
+		if _is_color_in_array(palette[i], transparent_manual_colors):
+			var pad: float = 4.0
+			var p0 := rect.position + Vector2(pad, pad)
+			var p1 := rect.position + rect.size - Vector2(pad, pad)
+			var p2 := rect.position + Vector2(rect.size.x - pad, pad)
+			var p3 := rect.position + Vector2(pad, rect.size.y - pad)
+			draw_line(p0, p1, Color(1.0, 0.2, 0.2, 1.0), 2.5)
+			draw_line(p2, p3, Color(1.0, 0.2, 0.2, 1.0), 2.5)
 		if i == selected_color_idx:
 			var select_rect := rect.grow(3.0)
 			draw_rect(select_rect, Color.WHITE, false, 2.0)
@@ -314,24 +373,26 @@ func _setup_toolbar_ui() -> void:
 	import_config_button.pressed.connect(_on_import_config_pressed)
 	hbox.add_child(import_config_button)
 
-	pick_image_button = Button.new()
-	pick_image_button.pressed.connect(_on_pick_image_pressed)
-	hbox.add_child(pick_image_button)
+	restore_button = Button.new()
+	restore_button.pressed.connect(_on_restore_pressed)
+	hbox.add_child(restore_button)
 
 	recommend_palette_button = Button.new()
 	recommend_palette_button.pressed.connect(_on_recommend_palette_pressed)
 	hbox.add_child(recommend_palette_button)
 
-	compose_sheet_button = Button.new()
-	compose_sheet_button.pressed.connect(_on_compose_sheet_pressed)
-	hbox.add_child(compose_sheet_button)
-
 	analyze_pixels_button = Button.new()
 	analyze_pixels_button.pressed.connect(_on_analyze_image_pixels_pressed)
 	hbox.add_child(analyze_pixels_button)
 
+	var limit_group_panel := PanelContainer.new()
+	hbox.add_child(limit_group_panel)
+	var limit_group_box := HBoxContainer.new()
+	limit_group_box.add_theme_constant_override("separation", 4)
+	limit_group_panel.add_child(limit_group_box)
+
 	color_limit_label = Label.new()
-	hbox.add_child(color_limit_label)
+	limit_group_box.add_child(color_limit_label)
 
 	image_color_limit_spinbox = SpinBox.new()
 	image_color_limit_spinbox.custom_minimum_size = Vector2(80, 0)
@@ -343,15 +404,15 @@ func _setup_toolbar_ui() -> void:
 	image_color_limit_spinbox.allow_greater = false
 	image_color_limit_spinbox.editable = true
 	image_color_limit_spinbox.value_changed.connect(_on_image_color_limit_changed)
-	hbox.add_child(image_color_limit_spinbox)
+	limit_group_box.add_child(image_color_limit_spinbox)
 
 	image_color_limit_max_button = Button.new()
 	image_color_limit_max_button.pressed.connect(_on_image_color_limit_max_pressed)
-	hbox.add_child(image_color_limit_max_button)
+	limit_group_box.add_child(image_color_limit_max_button)
 	_disable_image_color_limit_ui()
 
 	merge_tolerance_label = Label.new()
-	hbox.add_child(merge_tolerance_label)
+	limit_group_box.add_child(merge_tolerance_label)
 
 	image_merge_tolerance_spinbox = SpinBox.new()
 	image_merge_tolerance_spinbox.custom_minimum_size = Vector2(90, 0)
@@ -363,22 +424,24 @@ func _setup_toolbar_ui() -> void:
 	image_merge_tolerance_spinbox.allow_greater = false
 	image_merge_tolerance_spinbox.editable = true
 	image_merge_tolerance_spinbox.value_changed.connect(_on_image_merge_tolerance_changed)
-	hbox.add_child(image_merge_tolerance_spinbox)
+	limit_group_box.add_child(image_merge_tolerance_spinbox)
 
 	_setup_reference_file_dialog(toolbar_layer)
 	_setup_sprite_sheet_file_dialog(toolbar_layer)
 	_setup_frame_split_window(toolbar_layer)
 	_setup_frame_preview_bar(toolbar_layer)
+	_setup_transparent_side_panel(toolbar_layer)
 	_setup_language_toggle_ui(toolbar_layer)
+	_refresh_transparent_panel_ui()
 	_refresh_toolbar_ui()
 
 
 func _setup_language_toggle_ui(parent_layer: CanvasLayer) -> void:
 	language_toggle_button = Button.new()
 	language_toggle_button.set_anchors_preset(Control.PRESET_TOP_RIGHT)
-	language_toggle_button.offset_left = -126
+	language_toggle_button.offset_left = -168
 	language_toggle_button.offset_top = 8
-	language_toggle_button.offset_right = -92
+	language_toggle_button.offset_right = -134
 	language_toggle_button.offset_bottom = 36
 	language_toggle_button.custom_minimum_size = Vector2(34, 28)
 	language_toggle_button.clip_text = true
@@ -387,9 +450,9 @@ func _setup_language_toggle_ui(parent_layer: CanvasLayer) -> void:
 
 	frames_toggle_button = Button.new()
 	frames_toggle_button.set_anchors_preset(Control.PRESET_TOP_RIGHT)
-	frames_toggle_button.offset_left = -84
+	frames_toggle_button.offset_left = -126
 	frames_toggle_button.offset_top = 8
-	frames_toggle_button.offset_right = -50
+	frames_toggle_button.offset_right = -92
 	frames_toggle_button.offset_bottom = 36
 	frames_toggle_button.custom_minimum_size = Vector2(34, 28)
 	frames_toggle_button.clip_text = true
@@ -398,14 +461,25 @@ func _setup_language_toggle_ui(parent_layer: CanvasLayer) -> void:
 
 	offset_toggle_button = Button.new()
 	offset_toggle_button.set_anchors_preset(Control.PRESET_TOP_RIGHT)
-	offset_toggle_button.offset_left = -42
+	offset_toggle_button.offset_left = -84
 	offset_toggle_button.offset_top = 8
-	offset_toggle_button.offset_right = -8
+	offset_toggle_button.offset_right = -50
 	offset_toggle_button.offset_bottom = 36
 	offset_toggle_button.custom_minimum_size = Vector2(34, 28)
 	offset_toggle_button.clip_text = true
 	offset_toggle_button.pressed.connect(_on_offset_toggle_pressed)
 	parent_layer.add_child(offset_toggle_button)
+
+	compose_sheet_button = Button.new()
+	compose_sheet_button.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	compose_sheet_button.offset_left = -42
+	compose_sheet_button.offset_top = 8
+	compose_sheet_button.offset_right = -8
+	compose_sheet_button.offset_bottom = 36
+	compose_sheet_button.custom_minimum_size = Vector2(34, 28)
+	compose_sheet_button.clip_text = true
+	compose_sheet_button.pressed.connect(_on_compose_sheet_pressed)
+	parent_layer.add_child(compose_sheet_button)
 
 
 func _draw_canvas() -> void:
@@ -413,15 +487,19 @@ func _draw_canvas() -> void:
 	var draw_origin: Vector2 = _get_canvas_draw_origin()
 	var canvas_size := Vector2(grid_width * scaled_cell_size, grid_height * scaled_cell_size)
 	draw_rect(Rect2(draw_origin, canvas_size), Color(0.08, 0.08, 0.08), true)
+	var checker_a := Color(0.18, 0.18, 0.18, 1.0)
+	var checker_b := Color(0.12, 0.12, 0.12, 1.0)
 
 	for y in grid_height:
 		for x in grid_width:
+			var cell_rect := Rect2(
+				draw_origin + Vector2(x * scaled_cell_size, y * scaled_cell_size),
+				Vector2(scaled_cell_size, scaled_cell_size)
+			)
 			var px: int = pixels[y][x]
-			if px >= 0 and px < palette.size():
-				var cell_rect := Rect2(
-					draw_origin + Vector2(x * scaled_cell_size, y * scaled_cell_size),
-					Vector2(scaled_cell_size, scaled_cell_size)
-				)
+			if px < 0:
+				draw_rect(cell_rect, checker_a if ((x + y) % 2 == 0) else checker_b, true)
+			elif px < palette.size():
 				draw_rect(cell_rect, palette[px], true)
 
 	var grid_line_width: float = maxf(1.0, canvas_zoom * 0.8)
@@ -476,6 +554,34 @@ func _try_select_palette(mouse_pos: Vector2) -> bool:
 	return false
 
 
+func _try_set_transparent_key_from_palette(mouse_pos: Vector2) -> bool:
+	for i in palette.size():
+		var item_pos := palette_origin + Vector2(i * (palette_item_size + 8), 0)
+		var rect := Rect2(item_pos, Vector2(palette_item_size, palette_item_size))
+		if rect.has_point(mouse_pos):
+			var chosen: Color = palette[i]
+			var existing_index: int = _find_color_index_in_array(chosen, transparent_manual_colors)
+			if existing_index >= 0:
+				transparent_manual_colors.remove_at(existing_index)
+				if transparent_manual_colors.is_empty():
+					transparent_key_enabled = false
+					transparent_collected_colors.clear()
+				else:
+					transparent_key_enabled = true
+					if _is_same_color(transparent_key_color, chosen):
+						transparent_key_color = transparent_manual_colors[transparent_manual_colors.size() - 1]
+			else:
+				transparent_key_enabled = true
+				transparent_key_color = chosen
+				transparent_manual_colors.append(chosen)
+			_recompute_transparent_collected_colors()
+			_refresh_transparent_panel_ui()
+			_apply_transparent_rule_immediately_for_current_frame()
+			queue_redraw()
+			return true
+	return false
+
+
 func _try_paint(mouse_pos: Vector2, color_index: int) -> void:
 	var cell := _mouse_to_cell(mouse_pos)
 	if cell.x < 0 or cell.y < 0:
@@ -500,7 +606,9 @@ func _mouse_to_cell(mouse_pos: Vector2) -> Vector2i:
 	return Vector2i(x, y)
 
 
-func _clear_canvas() -> void:
+func _clear_canvas(record_undo: bool = false) -> void:
+	if record_undo:
+		_push_undo_snapshot()
 	for y in grid_height:
 		for x in grid_width:
 			pixels[y][x] = -1
@@ -518,8 +626,8 @@ func _apply_canvas_size(size: Vector2i) -> void:
 
 
 func _sync_canvas_origin() -> void:
-	palette_origin = Vector2(16, 56)
-	canvas_origin = Vector2(16, 96)
+	palette_origin = Vector2(208, 56)
+	canvas_origin = Vector2(208, 96)
 	canvas_pan = Vector2.ZERO
 	canvas_zoom = 1.0
 
@@ -662,7 +770,7 @@ func _on_preset_selected(index: int) -> void:
 
 
 func _on_clear_pressed() -> void:
-	_clear_canvas()
+	_clear_canvas(true)
 
 
 func _on_export_pressed() -> void:
@@ -677,17 +785,55 @@ func _on_import_config_pressed() -> void:
 	_import_config_json()
 
 
-func _on_pick_image_pressed() -> void:
-	if reference_file_dialog == null:
-		push_error("文件选择框未初始化。")
+func _on_restore_pressed() -> void:
+	if sprite_sheet_image != null and original_sprite_sheet_image != null:
+		if not _has_selected_frame_source():
+			push_error("还原失败：请先在底部预览中选中当前帧。")
+			return
+		if sprite_sheet_image.get_format() != Image.FORMAT_RGBA8:
+			sprite_sheet_image.convert(Image.FORMAT_RGBA8)
+		var rect: Rect2i = frame_rects[selected_preview_frame_index]
+		var src_w: int = original_sprite_sheet_image.get_width()
+		var src_h: int = original_sprite_sheet_image.get_height()
+		for y in range(rect.size.y):
+			for x in range(rect.size.x):
+				var sx: int = rect.position.x + x
+				var sy: int = rect.position.y + y
+				if sx < 0 or sy < 0 or sx >= src_w or sy >= src_h:
+					continue
+				sprite_sheet_image.set_pixel(sx, sy, original_sprite_sheet_image.get_pixel(sx, sy))
+		sprite_sheet_texture = ImageTexture.create_from_image(sprite_sheet_image)
+		_refresh_frame_preview_strip()
+		_load_frame_to_canvas(selected_preview_frame_index)
+		queue_redraw()
+		print("已还原：当前帧。")
 		return
-	reference_file_dialog.popup_centered_ratio(0.7)
+	if original_reference_source_image != null:
+		committed_reference_source_image = original_reference_source_image.duplicate()
+		if committed_reference_source_image.get_format() != Image.FORMAT_RGBA8:
+			committed_reference_source_image.convert(Image.FORMAT_RGBA8)
+		var restored_resized: Image = committed_reference_source_image.duplicate()
+		restored_resized.resize(grid_width, grid_height, Image.INTERPOLATE_NEAREST)
+		_quantize_image_to_pixels(restored_resized, palette)
+		queue_redraw()
+		print("已还原：单图原始版本。")
+		return
+	push_error("还原失败：当前没有可还原的原始版本。")
 
 
 func _on_reference_file_selected(path: String) -> void:
 	current_reference_image_path = path
+	committed_reference_source_image = null
+	original_reference_source_image = null
 	_clear_image_pixel_palette_preset()
 	_import_reference_and_quantize_from_path(path)
+	_capture_original_reference_source_image()
+	if transparent_key_enabled:
+		_recompute_transparent_collected_colors()
+		_refresh_transparent_panel_ui()
+	# Keep "limit colors" and tolerance pipeline initialized for single-image workflow.
+	_analyze_reference_image_pixels(false)
+	_normalize_color_limit_spinbox_value()
 
 
 func _on_recommend_palette_pressed() -> void:
@@ -708,6 +854,7 @@ func _on_image_color_limit_changed(value: float) -> void:
 	_normalize_color_limit_spinbox_value()
 	if image_pixel_palette_full.is_empty():
 		return
+	_reset_transparent_state(true)
 	var clamped_limit: int = clampi(int(value), 1, image_pixel_palette_full.size())
 	if clamped_limit != int(value):
 		suppress_image_color_limit_signal = true
@@ -721,6 +868,7 @@ func _on_image_color_limit_max_pressed() -> void:
 		return
 	if image_color_limit_spinbox.max_value < 1:
 		return
+	_reset_transparent_state(true)
 	var max_value: int = int(image_color_limit_spinbox.max_value)
 	image_color_limit_spinbox.value = max_value
 	_apply_image_pixel_palette_limit(max_value, true)
@@ -734,9 +882,65 @@ func _on_image_merge_tolerance_changed(value: float) -> void:
 		suppress_merge_tolerance_signal = true
 		image_merge_tolerance_spinbox.value = clamped_value
 		suppress_merge_tolerance_signal = false
+	if clamped_value != image_merge_tolerance_percent:
+		_reset_transparent_state(true)
 	image_merge_tolerance_percent = clamped_value
 	if _has_active_source_image():
 		_analyze_reference_image_pixels(true)
+
+
+func _on_transparent_tolerance_changed(value: float) -> void:
+	if suppress_transparent_tolerance_signal:
+		return
+	var clamped: float = snappedf(clampf(value, 0.0, 100.0), 0.1)
+	if not is_equal_approx(clamped, value):
+		suppress_transparent_tolerance_signal = true
+		transparent_tolerance_spinbox.value = clamped
+		suppress_transparent_tolerance_signal = false
+	transparent_tolerance_percent = clamped
+	_recompute_transparent_collected_colors()
+	_refresh_transparent_panel_ui()
+	_apply_transparent_rule_immediately_for_current_frame()
+
+
+func _on_transparent_apply_all_pressed() -> void:
+	_apply_transparent_rule_to_all_frames()
+
+
+func _on_transparent_key_swatch_gui_input(event: InputEvent) -> void:
+	if not (event is InputEventMouseButton):
+		return
+	var mb := event as InputEventMouseButton
+	if mb.button_index == MOUSE_BUTTON_RIGHT and mb.pressed:
+		transparent_key_enabled = false
+		transparent_manual_colors.clear()
+		transparent_collected_colors.clear()
+		_refresh_transparent_panel_ui()
+		_apply_transparent_rule_immediately_for_current_frame()
+		queue_redraw()
+
+
+func _on_transparent_set_chip_gui_input(event: InputEvent, chip_color: Color) -> void:
+	if not (event is InputEventMouseButton):
+		return
+	var mb := event as InputEventMouseButton
+	if not mb.pressed or mb.button_index != MOUSE_BUTTON_RIGHT:
+		return
+	var idx: int = _find_color_index_in_array(chip_color, transparent_manual_colors)
+	if idx < 0:
+		return
+	transparent_manual_colors.remove_at(idx)
+	if transparent_manual_colors.is_empty():
+		transparent_key_enabled = false
+		transparent_collected_colors.clear()
+	else:
+		transparent_key_enabled = true
+		if _is_same_color(transparent_key_color, chip_color):
+			transparent_key_color = transparent_manual_colors[transparent_manual_colors.size() - 1]
+	_recompute_transparent_collected_colors()
+	_refresh_transparent_panel_ui()
+	_apply_transparent_rule_immediately_for_current_frame()
+	queue_redraw()
 
 
 func _on_language_toggle_pressed() -> void:
@@ -783,10 +987,14 @@ func _on_sprite_sheet_selected(path: String) -> void:
 	if load_result != OK:
 		push_error("序列帧加载失败，错误码: %s" % str(load_result))
 		return
+	image.convert(Image.FORMAT_RGBA8)
 	sprite_sheet_image = image
+	original_sprite_sheet_image = sprite_sheet_image.duplicate()
 	sprite_sheet_texture = ImageTexture.create_from_image(sprite_sheet_image)
 	frame_split_rows = 3
 	frame_split_cols = 3
+	transparent_state_by_frame.clear()
+	_reset_transparent_state(true)
 	frame_offset_mode_active = false
 	frame_offset_pixels = Vector2i.ZERO
 	frame_offset_target_frame_index = -1
@@ -796,8 +1004,19 @@ func _on_sprite_sheet_selected(path: String) -> void:
 
 
 func _on_frame_grid_apply_pressed() -> void:
-	frame_split_rows = clampi(int(frame_rows_spinbox.value), 1, 128)
-	frame_split_cols = clampi(int(frame_cols_spinbox.value), 1, 128)
+	frame_split_rows = clampi(int(frame_rows_spinbox.value), 0, 128)
+	frame_split_cols = clampi(int(frame_cols_spinbox.value), 0, 128)
+	_apply_grid_split_to_frames()
+	_sync_frame_selection_with_editing_frame()
+
+
+func _on_frame_single_pressed() -> void:
+	frame_split_rows = 0
+	frame_split_cols = 0
+	if frame_rows_spinbox != null:
+		frame_rows_spinbox.value = 0
+	if frame_cols_spinbox != null:
+		frame_cols_spinbox.value = 0
 	_apply_grid_split_to_frames()
 	_sync_frame_selection_with_editing_frame()
 
@@ -895,7 +1114,9 @@ func _on_frame_thumb_gui_input(event: InputEvent, frame_index: int) -> void:
 		var mb := event as InputEventMouseButton
 		if not mb.pressed:
 			return
+		_save_current_frame_before_switch(frame_index)
 		selected_preview_frame_index = frame_index
+		_restore_transparent_state_for_frame(frame_index)
 		if frame_offset_mode_active:
 			frame_offset_target_frame_index = frame_index
 			frame_offset_pixels = Vector2i.ZERO
@@ -915,16 +1136,82 @@ func _select_preview_frame_by_offset(step: int) -> void:
 	if frame_rects.is_empty():
 		return
 	var current_idx: int = selected_preview_frame_index
+	_save_current_frame_before_switch(-1)
 	if current_idx < 0 or current_idx >= frame_rects.size():
 		current_idx = 0 if step > 0 else frame_rects.size() - 1
 	else:
 		current_idx = (current_idx + step + frame_rects.size()) % frame_rects.size()
 	selected_preview_frame_index = current_idx
+	_restore_transparent_state_for_frame(current_idx)
 	if frame_offset_mode_active:
 		frame_offset_target_frame_index = current_idx
 		frame_offset_pixels = Vector2i.ZERO
 	_analyze_reference_image_pixels(false)
 	_load_frame_to_canvas(current_idx)
+
+
+func _save_current_frame_before_switch(next_frame_index: int) -> void:
+	if not _has_selected_frame_source():
+		return
+	if next_frame_index >= 0 and next_frame_index == selected_preview_frame_index:
+		return
+	_save_transparent_state_for_frame(selected_preview_frame_index)
+	_commit_current_canvas_to_active_source()
+
+
+func _begin_paint_stroke_snapshot() -> void:
+	if paint_stroke_active:
+		return
+	_push_undo_snapshot()
+	paint_stroke_active = true
+
+
+func _push_undo_snapshot() -> void:
+	var snapshot: Dictionary = {
+		"grid_width": grid_width,
+		"grid_height": grid_height,
+		"frame_index": selected_preview_frame_index,
+		"pixels": _clone_pixels_grid(pixels)
+	}
+	undo_stack.append(snapshot)
+	if undo_stack.size() > UNDO_MAX_STEPS:
+		undo_stack.remove_at(0)
+
+
+func _undo_last_action() -> void:
+	if undo_stack.is_empty():
+		return
+	var snapshot: Dictionary = undo_stack[undo_stack.size() - 1]
+	undo_stack.remove_at(undo_stack.size() - 1)
+	if int(snapshot.get("grid_width", -1)) != grid_width or int(snapshot.get("grid_height", -1)) != grid_height:
+		return
+	var px_any: Variant = snapshot.get("pixels", [])
+	if not (px_any is Array):
+		return
+	var restored_pixels: Array[Array] = _clone_pixels_grid(px_any as Array)
+	if restored_pixels.size() != grid_height:
+		return
+	pixels = restored_pixels
+	if _has_selected_frame_source():
+		_commit_current_canvas_to_active_source()
+	elif committed_reference_source_image != null:
+		committed_reference_source_image = _build_canvas_image()
+	queue_redraw()
+
+
+func _clone_pixels_grid(source_rows: Array) -> Array[Array]:
+	var out: Array[Array] = []
+	for row_any in source_rows:
+		var row_src_any: Variant = row_any
+		if not (row_src_any is Array):
+			continue
+		var row_src: Array = row_src_any as Array
+		var row_dst: Array[int] = []
+		row_dst.resize(row_src.size())
+		for i in range(row_src.size()):
+			row_dst[i] = int(row_src[i])
+		out.append(row_dst)
+	return out
 
 
 func _on_frame_split_window_close_requested() -> void:
@@ -971,13 +1258,8 @@ func _try_pick_palette_by_number(keycode: Key) -> void:
 
 func _export_png() -> void:
 	_ensure_output_dir()
-	var img := Image.create(grid_width, grid_height, false, Image.FORMAT_RGBA8)
-	img.fill(Color(0, 0, 0, 0))
-	for y in grid_height:
-		for x in grid_width:
-			var px: int = pixels[y][x]
-			if px >= 0 and px < palette.size():
-				img.set_pixel(x, y, palette[px])
+	# Export strictly from the current canvas pixel grid, one source pixel to one output pixel.
+	var img: Image = _build_canvas_image()
 
 	var stamp := Time.get_datetime_string_from_system().replace(":", "-").replace(" ", "_")
 	var save_path := "%s/pixel_art_%s.png" % [OUTPUT_DIR, stamp]
@@ -986,6 +1268,20 @@ func _export_png() -> void:
 		print("导出成功: ", save_path)
 	else:
 		push_error("导出失败，错误码: %s" % str(result))
+
+
+func _apply_transparent_rule_to_image(source: Image) -> Image:
+	var out_img: Image = source.duplicate()
+	if out_img.get_format() != Image.FORMAT_RGBA8:
+		out_img.convert(Image.FORMAT_RGBA8)
+	if not transparent_key_enabled:
+		return out_img
+	for y in range(out_img.get_height()):
+		for x in range(out_img.get_width()):
+			var c: Color = out_img.get_pixel(x, y)
+			if _should_treat_as_transparent_by_key(c):
+				out_img.set_pixel(x, y, Color(c.r, c.g, c.b, 0.0))
+	return out_img
 
 
 func _export_composed_sheet_png() -> void:
@@ -1197,7 +1493,7 @@ func _setup_frame_split_window(parent_node: Node) -> void:
 	top.add_child(frame_rows_label)
 
 	frame_rows_spinbox = SpinBox.new()
-	frame_rows_spinbox.min_value = 1
+	frame_rows_spinbox.min_value = 0
 	frame_rows_spinbox.max_value = 128
 	frame_rows_spinbox.step = 1
 	frame_rows_spinbox.value = frame_split_rows
@@ -1210,7 +1506,7 @@ func _setup_frame_split_window(parent_node: Node) -> void:
 	top.add_child(frame_cols_label)
 
 	frame_cols_spinbox = SpinBox.new()
-	frame_cols_spinbox.min_value = 1
+	frame_cols_spinbox.min_value = 0
 	frame_cols_spinbox.max_value = 128
 	frame_cols_spinbox.step = 1
 	frame_cols_spinbox.value = frame_split_cols
@@ -1222,6 +1518,11 @@ func _setup_frame_split_window(parent_node: Node) -> void:
 	frame_apply_grid_button.name = "ApplyGridButton"
 	frame_apply_grid_button.pressed.connect(_on_frame_grid_apply_pressed)
 	top.add_child(frame_apply_grid_button)
+
+	frame_single_button = Button.new()
+	frame_single_button.name = "SingleFrameButton"
+	frame_single_button.pressed.connect(_on_frame_single_pressed)
+	top.add_child(frame_single_button)
 
 	frame_crop_button = Button.new()
 	frame_crop_button.name = "CropImageButton"
@@ -1286,6 +1587,80 @@ func _setup_frame_preview_bar(parent_node: Node) -> void:
 	frame_preview_bar.visible = false
 
 
+func _setup_transparent_side_panel(parent_node: Node) -> void:
+	transparent_side_panel = PanelContainer.new()
+	transparent_side_panel.set_anchors_preset(Control.PRESET_LEFT_WIDE)
+	transparent_side_panel.offset_left = 8
+	transparent_side_panel.offset_top = 56
+	transparent_side_panel.offset_right = 196
+	transparent_side_panel.offset_bottom = -124
+	parent_node.add_child(transparent_side_panel)
+
+	var margin := MarginContainer.new()
+	margin.add_theme_constant_override("margin_left", 6)
+	margin.add_theme_constant_override("margin_top", 6)
+	margin.add_theme_constant_override("margin_right", 6)
+	margin.add_theme_constant_override("margin_bottom", 6)
+	transparent_side_panel.add_child(margin)
+
+	var root := VBoxContainer.new()
+	root.add_theme_constant_override("separation", 6)
+	margin.add_child(root)
+
+	transparent_panel_title_label = Label.new()
+	root.add_child(transparent_panel_title_label)
+
+	var current_row := HBoxContainer.new()
+	current_row.add_theme_constant_override("separation", 4)
+	root.add_child(current_row)
+
+	transparent_key_label = Label.new()
+	current_row.add_child(transparent_key_label)
+
+	transparent_key_swatch = ColorRect.new()
+	transparent_key_swatch.custom_minimum_size = Vector2(20, 20)
+	transparent_key_swatch.mouse_filter = Control.MOUSE_FILTER_STOP
+	transparent_key_swatch.gui_input.connect(_on_transparent_key_swatch_gui_input)
+	current_row.add_child(transparent_key_swatch)
+
+	transparent_tolerance_label = Label.new()
+	root.add_child(transparent_tolerance_label)
+
+	transparent_tolerance_spinbox = SpinBox.new()
+	transparent_tolerance_spinbox.custom_minimum_size = Vector2(80, 0)
+	transparent_tolerance_spinbox.min_value = 0
+	transparent_tolerance_spinbox.max_value = 100
+	transparent_tolerance_spinbox.step = 0.1
+	transparent_tolerance_spinbox.value = transparent_tolerance_percent
+	transparent_tolerance_spinbox.allow_lesser = false
+	transparent_tolerance_spinbox.allow_greater = false
+	transparent_tolerance_spinbox.value_changed.connect(_on_transparent_tolerance_changed)
+	root.add_child(transparent_tolerance_spinbox)
+
+	var action_row := HBoxContainer.new()
+	action_row.add_theme_constant_override("separation", 4)
+	root.add_child(action_row)
+
+	transparent_apply_all_button = Button.new()
+	transparent_apply_all_button.pressed.connect(_on_transparent_apply_all_pressed)
+	action_row.add_child(transparent_apply_all_button)
+
+	transparent_rules_title_label = Label.new()
+	root.add_child(transparent_rules_title_label)
+
+	transparent_rules_scroll = ScrollContainer.new()
+	transparent_rules_scroll.custom_minimum_size = Vector2(0, 120)
+	transparent_rules_scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	transparent_rules_scroll.vertical_scroll_mode = ScrollContainer.SCROLL_MODE_AUTO
+	transparent_rules_scroll.size_flags_vertical = Control.SIZE_EXPAND_FILL
+	root.add_child(transparent_rules_scroll)
+
+	transparent_rules_flow = FlowContainer.new()
+	transparent_rules_flow.custom_minimum_size = Vector2(0, 48)
+	transparent_rules_flow.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	transparent_rules_scroll.add_child(transparent_rules_flow)
+
+
 func _ui_text(key: String) -> String:
 	if not ui_texts.has(current_language):
 		return key
@@ -1306,8 +1681,8 @@ func _apply_ui_language() -> void:
 		export_config_button.text = _ui_text("export_cfg")
 	if import_config_button != null:
 		import_config_button.text = _ui_text("import_cfg")
-	if pick_image_button != null:
-		pick_image_button.text = _ui_text("pick_image")
+	if restore_button != null:
+		restore_button.text = _ui_text("restore")
 	if recommend_palette_button != null:
 		recommend_palette_button.text = _ui_text("recommend")
 	if compose_sheet_button != null:
@@ -1318,6 +1693,16 @@ func _apply_ui_language() -> void:
 		color_limit_label.text = _ui_text("limit")
 	if image_color_limit_max_button != null:
 		image_color_limit_max_button.text = _ui_text("limit_max")
+	if transparent_panel_title_label != null:
+		transparent_panel_title_label.text = _ui_text("transparent_panel_title")
+	if transparent_key_label != null:
+		transparent_key_label.text = _ui_text("transparent_key")
+	if transparent_tolerance_label != null:
+		transparent_tolerance_label.text = _ui_text("transparent_tol")
+	if transparent_apply_all_button != null:
+		transparent_apply_all_button.text = _ui_text("transparent_apply_all")
+	if transparent_rules_title_label != null:
+		transparent_rules_title_label.text = _ui_text("transparent_rules_title")
 	if merge_tolerance_label != null:
 		merge_tolerance_label.text = _ui_text("tolerance")
 	if language_toggle_button != null:
@@ -1328,6 +1713,7 @@ func _apply_ui_language() -> void:
 	_update_reference_dialog_text()
 	_update_sprite_sheet_dialog_text()
 	_update_frame_window_text()
+	_refresh_transparent_panel_ui()
 
 
 func _update_offset_toggle_button_text() -> void:
@@ -1385,6 +1771,8 @@ func _update_frame_window_text() -> void:
 		frame_cols_label.text = _ui_text("cols")
 	if frame_apply_grid_button != null:
 		frame_apply_grid_button.text = _ui_text("apply_grid")
+	if frame_single_button != null:
+		frame_single_button.text = _ui_text("single_frame")
 	if frame_crop_button != null:
 		frame_crop_button.text = _ui_text("crop_image")
 
@@ -1417,6 +1805,8 @@ func _set_frame_window_mode(only_save_current_frame: bool) -> void:
 		frame_cols_spinbox.visible = show_full_controls
 	if frame_apply_grid_button != null:
 		frame_apply_grid_button.visible = show_full_controls
+	if frame_single_button != null:
+		frame_single_button.visible = show_full_controls
 	if frame_crop_button != null:
 		frame_crop_button.visible = show_full_controls
 
@@ -1435,6 +1825,11 @@ func _apply_grid_split_to_frames() -> void:
 	frame_rects.clear()
 	var w: int = sprite_sheet_image.get_width()
 	var h: int = sprite_sheet_image.get_height()
+	if frame_split_rows <= 0 or frame_split_cols <= 0:
+		frame_rects.append(Rect2i(0, 0, max(1, w), max(1, h)))
+		_refresh_frame_grid_overlay()
+		_refresh_frame_preview_strip()
+		return
 	for row in range(frame_split_rows):
 		for col in range(frame_split_cols):
 			var x0: int = int(floor(float(col) * float(w) / float(frame_split_cols)))
@@ -1504,6 +1899,9 @@ func _load_frame_to_canvas(frame_index: int) -> void:
 	if selected_preview_frame_index != frame_index:
 		selected_preview_frame_index = frame_index
 	_refresh_frame_preview_strip()
+	if transparent_key_enabled:
+		_recompute_transparent_collected_colors()
+		_refresh_transparent_panel_ui()
 
 
 func _update_frame_selection_from_drag(start_local: Vector2, end_local: Vector2) -> void:
@@ -1661,6 +2059,388 @@ func _set_image_color_limit_ui(max_colors: int, selected_value: int = -1) -> voi
 	suppress_image_color_limit_signal = false
 
 
+func _refresh_transparent_panel_ui() -> void:
+	if transparent_key_swatch != null:
+		if transparent_key_enabled:
+			transparent_key_swatch.color = transparent_key_color
+		else:
+			transparent_key_swatch.color = Color(0.2, 0.2, 0.2, 1.0)
+	if transparent_tolerance_spinbox != null:
+		transparent_tolerance_spinbox.value = transparent_tolerance_percent
+		transparent_tolerance_spinbox.editable = transparent_key_enabled
+	_rebuild_transparent_rules_flow_ui()
+
+
+func _rebuild_transparent_rules_flow_ui() -> void:
+	if transparent_rules_flow == null:
+		return
+	for child in transparent_rules_flow.get_children():
+		child.queue_free()
+	for c in transparent_collected_colors:
+		var chip: PanelContainer = _create_transparent_chip(c, _is_color_in_array(c, transparent_manual_colors))
+		chip.gui_input.connect(_on_transparent_set_chip_gui_input.bind(c))
+		transparent_rules_flow.add_child(chip)
+
+
+func _create_transparent_chip(color: Color, selected: bool) -> PanelContainer:
+	var chip := PanelContainer.new()
+	chip.custom_minimum_size = Vector2(20, 20)
+	chip.mouse_filter = Control.MOUSE_FILTER_STOP
+	var bg := StyleBoxFlat.new()
+	bg.bg_color = color
+	bg.border_width_left = 1
+	bg.border_width_top = 1
+	bg.border_width_right = 1
+	bg.border_width_bottom = 1
+	bg.border_color = Color(0.15, 0.15, 0.15, 1.0)
+	if selected:
+		bg.border_width_left = 2
+		bg.border_width_top = 2
+		bg.border_width_right = 2
+		bg.border_width_bottom = 2
+		bg.border_color = Color(0.2, 1.0, 0.35, 1.0)
+	chip.add_theme_stylebox_override("panel", bg)
+	return chip
+
+
+func _rebuild_from_active_source_after_transparent_rule_change() -> void:
+	if _has_selected_frame_source():
+		_load_frame_to_canvas(selected_preview_frame_index)
+	elif FileAccess.file_exists(current_reference_image_path):
+		_import_reference_and_quantize_from_path(current_reference_image_path)
+	if _has_active_source_image():
+		_analyze_reference_image_pixels(true)
+
+
+func _apply_transparent_rule_to_all_frames() -> void:
+	if sprite_sheet_image == null or frame_rects.is_empty():
+		push_error("应用失败，请先导入并切分帧。")
+		return
+	if sprite_sheet_image.get_format() != Image.FORMAT_RGBA8:
+		sprite_sheet_image.convert(Image.FORMAT_RGBA8)
+	var shared_state: Dictionary = _build_transparent_state_snapshot()
+	for i in range(frame_rects.size()):
+		transparent_state_by_frame[i] = shared_state.duplicate(true)
+	var enable_rule: bool = transparent_key_enabled and not transparent_collected_colors.is_empty()
+
+	for i in range(frame_rects.size()):
+		var rect: Rect2i = frame_rects[i]
+		var limited_base: Image = _build_limited_base_image_for_frame(i)
+		if limited_base == null:
+			continue
+		var source_frame: Image = limited_base.duplicate()
+		source_frame.resize(rect.size.x, rect.size.y, Image.INTERPOLATE_NEAREST)
+		for y in range(rect.size.y):
+			for x in range(rect.size.x):
+				var sx: int = rect.position.x + x
+				var sy: int = rect.position.y + y
+				var c: Color = source_frame.get_pixel(x, y)
+				if enable_rule and _should_treat_as_transparent_by_key(c):
+					sprite_sheet_image.set_pixel(sx, sy, Color(c.r, c.g, c.b, 0.0))
+				else:
+					sprite_sheet_image.set_pixel(sx, sy, c)
+
+	sprite_sheet_texture = ImageTexture.create_from_image(sprite_sheet_image)
+	_refresh_frame_preview_strip()
+	if _has_selected_frame_source():
+		_load_frame_to_canvas(selected_preview_frame_index)
+	queue_redraw()
+
+
+func _apply_transparent_rule_to_current_frame() -> void:
+	if not transparent_key_enabled or transparent_collected_colors.is_empty():
+		push_error("请先选中透明像素并设置宽容度。")
+		return
+	if _has_selected_frame_source():
+		if sprite_sheet_image.get_format() != Image.FORMAT_RGBA8:
+			sprite_sheet_image.convert(Image.FORMAT_RGBA8)
+		var rect: Rect2i = frame_rects[selected_preview_frame_index]
+		var limited_base: Image = _build_limited_base_image_for_frame(selected_preview_frame_index)
+		if limited_base == null:
+			push_error("应用失败，无法构建限色基准图。")
+			return
+		var source_frame: Image = limited_base.duplicate()
+		source_frame.resize(rect.size.x, rect.size.y, Image.INTERPOLATE_NEAREST)
+		for y in range(rect.size.y):
+			for x in range(rect.size.x):
+				var sx: int = rect.position.x + x
+				var sy: int = rect.position.y + y
+				var c: Color = source_frame.get_pixel(x, y)
+				if _should_treat_as_transparent_by_key(c):
+					sprite_sheet_image.set_pixel(sx, sy, Color(c.r, c.g, c.b, 0.0))
+				else:
+					sprite_sheet_image.set_pixel(sx, sy, c)
+		sprite_sheet_texture = ImageTexture.create_from_image(sprite_sheet_image)
+		_refresh_frame_preview_strip()
+		_load_frame_to_canvas(selected_preview_frame_index)
+	else:
+		var source_img: Image = _load_active_limited_base_resized_image()
+		if source_img == null:
+			push_error("应用失败，找不到限色基准图。")
+			return
+		_quantize_image_to_pixels_with_transparent_rule(source_img, palette)
+		_commit_current_canvas_to_active_source()
+	queue_redraw()
+
+
+func _quantize_image_to_palette_image(source: Image, target_palette: Array[Color]) -> Image:
+	if source == null or target_palette.is_empty():
+		return null
+	var out_img: Image = Image.create(source.get_width(), source.get_height(), false, Image.FORMAT_RGBA8)
+	out_img.fill(Color(0, 0, 0, 0))
+	for y in range(source.get_height()):
+		for x in range(source.get_width()):
+			var c: Color = source.get_pixel(x, y)
+			if c.a < 0.1:
+				out_img.set_pixel(x, y, Color(c.r, c.g, c.b, 0.0))
+			else:
+				var idx: int = _find_nearest_palette_index_in_array(c, target_palette)
+				var mapped: Color = target_palette[idx]
+				out_img.set_pixel(x, y, Color(mapped.r, mapped.g, mapped.b, 1.0))
+	return out_img
+
+
+func _build_limited_base_image_for_frame(frame_index: int) -> Image:
+	if sprite_sheet_image == null or frame_index < 0 or frame_index >= frame_rects.size() or palette.is_empty():
+		return null
+	var source_sheet: Image = original_sprite_sheet_image if original_sprite_sheet_image != null else sprite_sheet_image
+	var rect: Rect2i = frame_rects[frame_index]
+	var frame_img: Image = source_sheet.get_region(rect)
+	var resized: Image = frame_img.duplicate()
+	resized.resize(grid_width, grid_height, Image.INTERPOLATE_NEAREST)
+	return _quantize_image_to_palette_image(resized, palette)
+
+
+func _load_active_limited_base_resized_image() -> Image:
+	if palette.is_empty():
+		return null
+	if _has_selected_frame_source():
+		return _build_limited_base_image_for_frame(selected_preview_frame_index)
+	var source: Image = _load_active_source_resized_image(Image.INTERPOLATE_NEAREST)
+	if source == null:
+		return null
+	return _quantize_image_to_palette_image(source, palette)
+
+
+func _build_canvas_image() -> Image:
+	var img: Image = Image.create(grid_width, grid_height, false, Image.FORMAT_RGBA8)
+	img.fill(Color(0, 0, 0, 0))
+	for y in range(grid_height):
+		for x in range(grid_width):
+			var px: int = pixels[y][x]
+			if px >= 0 and px < palette.size():
+				img.set_pixel(x, y, palette[px])
+	return img
+
+
+func _commit_current_canvas_to_active_source() -> void:
+	var canvas_img: Image = _build_canvas_image()
+	if _has_selected_frame_source():
+		var frame_idx: int = selected_preview_frame_index
+		if frame_idx < 0 or frame_idx >= frame_rects.size():
+			return
+		if sprite_sheet_image.get_format() != Image.FORMAT_RGBA8:
+			sprite_sheet_image.convert(Image.FORMAT_RGBA8)
+		var rect: Rect2i = frame_rects[frame_idx]
+		var frame_img: Image = canvas_img.duplicate()
+		frame_img.resize(rect.size.x, rect.size.y, Image.INTERPOLATE_NEAREST)
+		for y in range(rect.size.y):
+			for x in range(rect.size.x):
+				sprite_sheet_image.set_pixel(rect.position.x + x, rect.position.y + y, frame_img.get_pixel(x, y))
+		sprite_sheet_texture = ImageTexture.create_from_image(sprite_sheet_image)
+		_refresh_frame_preview_strip()
+		_load_frame_to_canvas(frame_idx)
+	else:
+		committed_reference_source_image = canvas_img
+
+
+func _get_transparent_key_threshold(tolerance_percent: float) -> float:
+	var t: float = clampf(float(tolerance_percent) / 100.0, 0.0, 1.0)
+	# Use a steeper curve so low-range adjustments are more delicate.
+	return 3.0 * pow(t, 2.6)
+
+
+func _should_treat_as_transparent_by_key(c: Color) -> bool:
+	if c.a < 0.1:
+		return true
+	if not transparent_key_enabled:
+		return false
+	return _is_color_in_array(c, transparent_collected_colors)
+
+
+func _collect_transparent_candidates_for(base_color: Color) -> Array[Color]:
+	var result: Array[Color] = []
+	var threshold: float = _get_transparent_key_threshold(transparent_tolerance_percent)
+	if threshold <= 0.0:
+		return result
+	var source: Image = _load_active_limited_base_resized_image()
+	if source != null:
+		for y in range(source.get_height()):
+			for x in range(source.get_width()):
+				var c: Color = source.get_pixel(x, y)
+				if c.a < 0.1:
+					continue
+				if _color_distance_weighted(c, base_color) <= threshold and not _is_color_in_array(c, result):
+					result.append(c)
+	return result
+
+
+func _apply_transparent_rule_immediately_for_current_frame() -> void:
+	if _has_selected_frame_source():
+		if sprite_sheet_image.get_format() != Image.FORMAT_RGBA8:
+			sprite_sheet_image.convert(Image.FORMAT_RGBA8)
+		var rect: Rect2i = frame_rects[selected_preview_frame_index]
+		var limited_base: Image = _build_limited_base_image_for_frame(selected_preview_frame_index)
+		if limited_base == null:
+			return
+		var source_frame: Image = limited_base.duplicate()
+		source_frame.resize(rect.size.x, rect.size.y, Image.INTERPOLATE_NEAREST)
+		var enable_rule: bool = transparent_key_enabled and not transparent_collected_colors.is_empty()
+		for y in range(rect.size.y):
+			for x in range(rect.size.x):
+				var sx: int = rect.position.x + x
+				var sy: int = rect.position.y + y
+				var c: Color = source_frame.get_pixel(x, y)
+				if enable_rule and _should_treat_as_transparent_by_key(c):
+					sprite_sheet_image.set_pixel(sx, sy, Color(c.r, c.g, c.b, 0.0))
+				else:
+					sprite_sheet_image.set_pixel(sx, sy, c)
+		sprite_sheet_texture = ImageTexture.create_from_image(sprite_sheet_image)
+		_refresh_frame_preview_strip()
+		_load_frame_to_canvas(selected_preview_frame_index)
+		queue_redraw()
+		return
+	var source: Image = _load_active_limited_base_resized_image()
+	if source == null or palette.is_empty():
+		return
+	if transparent_key_enabled and not transparent_collected_colors.is_empty():
+		_quantize_image_to_pixels_with_transparent_rule(source, palette)
+	else:
+		_quantize_image_to_pixels(source, palette)
+	_commit_current_canvas_to_active_source()
+	queue_redraw()
+
+
+func _refresh_transparent_preview_from_original_source() -> void:
+	var source: Image = _load_active_original_source_resized_image(Image.INTERPOLATE_NEAREST)
+	if source == null or palette.is_empty():
+		return
+	_quantize_image_to_pixels_with_transparent_rule(source, palette)
+
+
+func _quantize_image_to_pixels_with_transparent_rule(source: Image, target_palette: Array[Color]) -> void:
+	if source == null or target_palette.is_empty():
+		return
+	_init_pixels()
+	for y in range(grid_height):
+		for x in range(grid_width):
+			var c: Color = source.get_pixel(x, y)
+			if _should_treat_as_transparent_by_key(c):
+				pixels[y][x] = -1
+			else:
+				pixels[y][x] = _find_nearest_palette_index_in_array(c, target_palette)
+	queue_redraw()
+
+
+func _recompute_transparent_collected_colors() -> void:
+	transparent_collected_colors.clear()
+	if not transparent_key_enabled or transparent_manual_colors.is_empty():
+		return
+	for base_color in transparent_manual_colors:
+		if not _is_color_in_array(base_color, transparent_collected_colors):
+			transparent_collected_colors.append(base_color)
+	if transparent_tolerance_percent <= 0.0:
+		return
+	for base_color in transparent_manual_colors:
+		var candidates: Array[Color] = _collect_transparent_candidates_for(base_color)
+		for c in candidates:
+			if not _is_color_in_array(c, transparent_collected_colors):
+				transparent_collected_colors.append(c)
+
+
+func _build_transparent_state_snapshot() -> Dictionary:
+	var manual_copy: Array[Color] = []
+	for c in transparent_manual_colors:
+		manual_copy.append(c)
+	return {
+		"enabled": transparent_key_enabled,
+		"key_color": transparent_key_color,
+		"tolerance": transparent_tolerance_percent,
+		"manual_colors": manual_copy
+	}
+
+
+func _save_transparent_state_for_frame(frame_index: int) -> void:
+	if frame_index < 0:
+		return
+	transparent_state_by_frame[frame_index] = _build_transparent_state_snapshot()
+
+
+func _restore_transparent_state_for_frame(frame_index: int) -> void:
+	if frame_index < 0:
+		return
+	if not transparent_state_by_frame.has(frame_index):
+		_reset_transparent_state(true)
+		return
+	var state_any: Variant = transparent_state_by_frame[frame_index]
+	if not (state_any is Dictionary):
+		_reset_transparent_state(true)
+		return
+	var state: Dictionary = state_any as Dictionary
+	transparent_key_enabled = bool(state.get("enabled", false))
+	transparent_key_color = state.get("key_color", Color(1.0, 0.0, 1.0, 1.0)) as Color
+	transparent_tolerance_percent = float(state.get("tolerance", 0.0))
+	transparent_manual_colors.clear()
+	var manual_any: Variant = state.get("manual_colors", [])
+	if manual_any is Array:
+		for c_any in (manual_any as Array):
+			if c_any is Color:
+				transparent_manual_colors.append(c_any as Color)
+	_recompute_transparent_collected_colors()
+	_refresh_transparent_panel_ui()
+	queue_redraw()
+
+
+func _reset_transparent_state(reset_tolerance: bool) -> void:
+	transparent_key_enabled = false
+	transparent_manual_colors.clear()
+	transparent_collected_colors.clear()
+	if reset_tolerance:
+		transparent_tolerance_percent = 0.0
+		if transparent_tolerance_spinbox != null:
+			suppress_transparent_tolerance_signal = true
+			transparent_tolerance_spinbox.value = 0.0
+			suppress_transparent_tolerance_signal = false
+	_refresh_transparent_panel_ui()
+	queue_redraw()
+
+
+func _is_color_in_array(color: Color, list: Array[Color]) -> bool:
+	for c in list:
+		if _is_same_color(c, color):
+			return true
+	return false
+
+
+func _find_color_index_in_array(color: Color, list: Array[Color]) -> int:
+	for i in range(list.size()):
+		if _is_same_color(list[i], color):
+			return i
+	return -1
+
+
+func _filter_out_colors(list: Array[Color], excluded: Array[Color]) -> Array[Color]:
+	var out: Array[Color] = []
+	for c in list:
+		if not _is_color_in_array(c, excluded):
+			out.append(c)
+	return out
+
+
+func _is_same_color(a: Color, b: Color) -> bool:
+	return a.to_rgba32() == b.to_rgba32()
+
+
 func _normalize_color_limit_spinbox_value() -> void:
 	if image_color_limit_spinbox == null:
 		return
@@ -1702,8 +2482,6 @@ func _analyze_reference_image_pixels(keep_limit_value: bool) -> void:
 	for y in range(grid_height):
 		for x in range(grid_width):
 			var c: Color = resized.get_pixel(x, y)
-			if c.a < 0.1:
-				continue
 
 			var nearest: Dictionary = _find_nearest_color_index_in_colors(c, merged_colors)
 			var nearest_idx: int = int(nearest.get("index", -1))
@@ -1787,9 +2565,19 @@ func _load_reference_resized_image(image_path: String, interpolation: int) -> Im
 	if load_result != OK:
 		push_error("读取失败，无法加载参考图，错误码: %s" % str(load_result))
 		return null
+	image.convert(Image.FORMAT_RGBA8)
 	var resized: Image = image.duplicate()
 	resized.resize(grid_width, grid_height, interpolation)
 	return resized
+
+
+func _capture_original_reference_source_image() -> void:
+	var src: Image = _load_reference_resized_image(current_reference_image_path, Image.INTERPOLATE_NEAREST)
+	if src == null:
+		return
+	if src.get_format() != Image.FORMAT_RGBA8:
+		src.convert(Image.FORMAT_RGBA8)
+	original_reference_source_image = src.duplicate()
 
 
 func _has_selected_frame_source() -> bool:
@@ -1807,6 +2595,34 @@ func _load_active_source_resized_image(interpolation: int) -> Image:
 		var resized: Image = frame_img.duplicate()
 		resized.resize(grid_width, grid_height, interpolation)
 		return resized
+	if committed_reference_source_image != null:
+		var committed_resized: Image = committed_reference_source_image.duplicate()
+		committed_resized.resize(grid_width, grid_height, interpolation)
+		return committed_resized
+	return _load_reference_resized_image(current_reference_image_path, interpolation)
+
+
+func _load_active_original_source_resized_image(interpolation: int) -> Image:
+	if _has_selected_frame_source():
+		if original_sprite_sheet_image != null:
+			var rect: Rect2i = frame_rects[selected_preview_frame_index]
+			var frame_img: Image = original_sprite_sheet_image.get_region(rect)
+			var resized: Image = frame_img.duplicate()
+			resized.resize(grid_width, grid_height, interpolation)
+			return resized
+		var fallback_rect: Rect2i = frame_rects[selected_preview_frame_index]
+		var fallback_frame: Image = sprite_sheet_image.get_region(fallback_rect)
+		var fallback_resized: Image = fallback_frame.duplicate()
+		fallback_resized.resize(grid_width, grid_height, interpolation)
+		return fallback_resized
+	if original_reference_source_image != null:
+		var original_resized: Image = original_reference_source_image.duplicate()
+		original_resized.resize(grid_width, grid_height, interpolation)
+		return original_resized
+	if committed_reference_source_image != null:
+		var committed_resized: Image = committed_reference_source_image.duplicate()
+		committed_resized.resize(grid_width, grid_height, interpolation)
+		return committed_resized
 	return _load_reference_resized_image(current_reference_image_path, interpolation)
 
 
@@ -1933,8 +2749,6 @@ func _calculate_quantization_error(source: Image, candidate_palette: Array) -> f
 	for y in range(grid_height):
 		for x in range(grid_width):
 			var c: Color = source.get_pixel(x, y)
-			if c.a < 0.1:
-				continue
 			var nearest_idx: int = _find_nearest_palette_index_in_array(c, candidate_palette)
 			var nearest_color: Color = candidate_palette[nearest_idx] as Color
 			total_error += _color_distance_weighted(c, nearest_color)
