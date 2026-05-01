@@ -2,7 +2,10 @@ extends Node2D
 
 const CONFIG_PATH := "res://configs/pixel_canvas_config.json"
 const REFERENCE_IMAGE_PATH := "res://configs/reference.png"
-const OUTPUT_DIR := "res://output"
+const DEFAULT_OUTPUT_DIR := "res://output"
+const EXPORT_KIND_NONE := 0
+const EXPORT_KIND_CANVAS := 1
+const EXPORT_KIND_SHEET := 2
 const IMAGE_PIXEL_PRESET_NAME := "此图像素"
 const LANG_ZH := "zh"
 const LANG_EN := "en"
@@ -85,6 +88,8 @@ var committed_reference_source_image: Image
 var original_reference_source_image: Image
 var original_sprite_sheet_image: Image
 var sprite_sheet_file_dialog: FileDialog
+var output_dir_file_dialog: FileDialog
+var pending_export_kind: int = EXPORT_KIND_NONE
 var frame_split_window: Window
 var frame_rows_label: Label
 var frame_rows_spinbox: SpinBox
@@ -140,6 +145,7 @@ var ui_texts: Dictionary = {
 		"offset_toggle": "偏",
 		"offset_apply_toggle": "应用偏移",
 		"dialog_title": "选择参考图片",
+		"export_dir_title": "选择导出目录",
 		"sheet_dialog_title": "选择序列帧图片",
 		"frame_window_title": "帧分割窗口",
 		"rows": "行:",
@@ -173,6 +179,7 @@ var ui_texts: Dictionary = {
 		"offset_toggle": "OF",
 		"offset_apply_toggle": "ApplyOfs",
 		"dialog_title": "Select Reference Image",
+		"export_dir_title": "Select Export Directory",
 		"sheet_dialog_title": "Select Sprite Sheet",
 		"frame_window_title": "Frame Split",
 		"rows": "Rows:",
@@ -427,6 +434,7 @@ func _setup_toolbar_ui() -> void:
 	limit_group_box.add_child(image_merge_tolerance_spinbox)
 
 	_setup_reference_file_dialog(toolbar_layer)
+	_setup_output_dir_file_dialog(toolbar_layer)
 	_setup_sprite_sheet_file_dialog(toolbar_layer)
 	_setup_frame_split_window(toolbar_layer)
 	_setup_frame_preview_bar(toolbar_layer)
@@ -1099,6 +1107,9 @@ func _on_frame_crop_button_pressed() -> void:
 		return
 
 	sprite_sheet_image = sprite_sheet_image.get_region(crop_rect)
+	# Keep "original" source in sync with the cropped sheet, so subsequent
+	# transparency/limit analysis is based on the cropped content.
+	original_sprite_sheet_image = sprite_sheet_image.duplicate()
 	sprite_sheet_texture = ImageTexture.create_from_image(sprite_sheet_image)
 	if frame_preview_texture_rect != null:
 		frame_preview_texture_rect.texture = sprite_sheet_texture
@@ -1257,17 +1268,7 @@ func _try_pick_palette_by_number(keycode: Key) -> void:
 
 
 func _export_png() -> void:
-	_ensure_output_dir()
-	# Export strictly from the current canvas pixel grid, one source pixel to one output pixel.
-	var img: Image = _build_canvas_image()
-
-	var stamp := Time.get_datetime_string_from_system().replace(":", "-").replace(" ", "_")
-	var save_path := "%s/pixel_art_%s.png" % [OUTPUT_DIR, stamp]
-	var result := img.save_png(save_path)
-	if result == OK:
-		print("导出成功: ", save_path)
-	else:
-		push_error("导出失败，错误码: %s" % str(result))
+	_request_export_directory(EXPORT_KIND_CANVAS)
 
 
 func _apply_transparent_rule_to_image(source: Image) -> Image:
@@ -1288,6 +1289,34 @@ func _export_composed_sheet_png() -> void:
 	if sprite_sheet_image == null or frame_rects.is_empty():
 		push_error("生成整图失败，请先导入并切出预览帧。")
 		return
+	_request_export_directory(EXPORT_KIND_SHEET)
+
+
+func _save_canvas_png_to_directory(selected_dir: String) -> void:
+	if selected_dir == "":
+		push_error("导出失败，未选择导出目录。")
+		return
+	var img: Image = _build_canvas_image()
+	var stamp := Time.get_datetime_string_from_system().replace(":", "-").replace(" ", "_")
+	var save_path := "%s/pixel_art_%s.png" % [selected_dir.trim_suffix("/").trim_suffix("\\"), stamp]
+	var result := img.save_png(save_path)
+	if result == OK:
+		print("导出成功: %s" % save_path)
+	else:
+		push_error("导出失败，错误码: %s" % str(result))
+
+
+func _save_composed_sheet_png_to_directory(selected_dir: String) -> void:
+	if selected_dir == "":
+		push_error("生成整图失败，未选择导出目录。")
+		return
+	if sprite_sheet_image == null or frame_rects.is_empty():
+		push_error("生成整图失败，请先导入并切出预览帧。")
+		return
+	# Ensure the current editable canvas changes are flushed into sprite_sheet_image
+	# before composing the final sheet, otherwise unswitched edits are missed.
+	if _has_selected_frame_source():
+		_commit_current_canvas_to_active_source()
 
 	var frame_count: int = frame_rects.size()
 	var cell_w: int = 1
@@ -1315,9 +1344,8 @@ func _export_composed_sheet_png() -> void:
 			for x in range(src_img.get_width()):
 				out_img.set_pixel(dst_x0 + x, dst_y0 + y, src_img.get_pixel(x, y))
 
-	_ensure_output_dir()
 	var stamp := Time.get_datetime_string_from_system().replace(":", "-").replace(" ", "_")
-	var save_path := "%s/frame_sheet_%s.png" % [OUTPUT_DIR, stamp]
+	var save_path := "%s/frame_sheet_%s.png" % [selected_dir.trim_suffix("/").trim_suffix("\\"), stamp]
 	var result: int = out_img.save_png(save_path)
 	if result == OK:
 		print("整图生成成功: %s (frames=%d, grid=%dx%d, cell=%dx%d)" % [save_path, frame_count, cols, rows, cell_w, cell_h])
@@ -1440,12 +1468,12 @@ func _ensure_config_dir() -> void:
 		push_error("创建配置目录失败，错误码: %s" % str(error_code))
 
 
-func _ensure_output_dir() -> void:
-	if DirAccess.dir_exists_absolute(ProjectSettings.globalize_path(OUTPUT_DIR)):
+func _request_export_directory(export_kind: int) -> void:
+	if output_dir_file_dialog == null:
+		push_error("导出目录选择框未初始化。")
 		return
-	var error_code := DirAccess.make_dir_recursive_absolute(ProjectSettings.globalize_path(OUTPUT_DIR))
-	if error_code != OK:
-		push_error("创建输出目录失败，错误码: %s" % str(error_code))
+	pending_export_kind = export_kind
+	output_dir_file_dialog.popup_centered_ratio(0.7)
 
 
 func _setup_reference_file_dialog(parent_node: Node) -> void:
@@ -1456,6 +1484,32 @@ func _setup_reference_file_dialog(parent_node: Node) -> void:
 	reference_file_dialog.file_selected.connect(_on_reference_file_selected)
 	parent_node.add_child(reference_file_dialog)
 	_update_reference_dialog_text()
+
+
+func _setup_output_dir_file_dialog(parent_node: Node) -> void:
+	output_dir_file_dialog = FileDialog.new()
+	output_dir_file_dialog.file_mode = FileDialog.FILE_MODE_OPEN_DIR
+	output_dir_file_dialog.access = FileDialog.ACCESS_FILESYSTEM
+	output_dir_file_dialog.use_native_dialog = true
+	output_dir_file_dialog.dir_selected.connect(_on_output_dir_selected)
+	parent_node.add_child(output_dir_file_dialog)
+	_update_output_dir_dialog_text()
+
+
+func _on_output_dir_selected(path: String) -> void:
+	var selected_path: String = path
+	if selected_path == "":
+		push_error("导出失败，未选择有效目录。")
+		pending_export_kind = EXPORT_KIND_NONE
+		return
+	match pending_export_kind:
+		EXPORT_KIND_CANVAS:
+			_save_canvas_png_to_directory(selected_path)
+		EXPORT_KIND_SHEET:
+			_save_composed_sheet_png_to_directory(selected_path)
+		_:
+			push_error("导出失败，未知导出类型。")
+	pending_export_kind = EXPORT_KIND_NONE
 
 
 func _setup_sprite_sheet_file_dialog(parent_node: Node) -> void:
@@ -1711,6 +1765,7 @@ func _apply_ui_language() -> void:
 		frames_toggle_button.text = _ui_text("frames_toggle")
 	_update_offset_toggle_button_text()
 	_update_reference_dialog_text()
+	_update_output_dir_dialog_text()
 	_update_sprite_sheet_dialog_text()
 	_update_frame_window_text()
 	_refresh_transparent_panel_ui()
@@ -1741,6 +1796,13 @@ func _update_reference_dialog_text() -> void:
 			"*.jpg,*.jpeg ; JPEG 图片",
 			"*.webp ; WEBP 图片"
 		])
+
+
+func _update_output_dir_dialog_text() -> void:
+	if output_dir_file_dialog == null:
+		return
+	output_dir_file_dialog.title = _ui_text("export_dir_title")
+	output_dir_file_dialog.current_dir = ProjectSettings.globalize_path(DEFAULT_OUTPUT_DIR)
 
 
 func _update_sprite_sheet_dialog_text() -> void:
@@ -2256,8 +2318,45 @@ func _commit_current_canvas_to_active_source() -> void:
 
 func _get_transparent_key_threshold(tolerance_percent: float) -> float:
 	var t: float = clampf(float(tolerance_percent) / 100.0, 0.0, 1.0)
-	# Use a steeper curve so low-range adjustments are more delicate.
-	return 3.0 * pow(t, 2.6)
+	# Keep low-range responsive enough for non-black hues while preserving headroom.
+	return 3.0 * t * t
+
+
+func _color_distance_transparency(a: Color, b: Color) -> float:
+	var dr: float = a.r - b.r
+	var dg: float = a.g - b.g
+	var db: float = a.b - b.b
+	# Use balanced RGB distance for transparency matching.
+	return dr * dr + dg * dg + db * db
+
+
+func _collect_unique_opaque_colors(source: Image) -> Array[Color]:
+	var unique_colors: Array[Color] = []
+	if source == null:
+		return unique_colors
+	for y in range(source.get_height()):
+		for x in range(source.get_width()):
+			var c: Color = source.get_pixel(x, y)
+			if c.a < 0.1:
+				continue
+			if not _is_color_in_array(c, unique_colors):
+				unique_colors.append(c)
+	return unique_colors
+
+
+func _find_nearest_color_in_list(target: Color, color_list: Array[Color]) -> Dictionary:
+	if color_list.is_empty():
+		return {"found": false, "color": Color(0, 0, 0, 1), "distance": INF}
+	var best_idx: int = -1
+	var best_dist: float = INF
+	for i in range(color_list.size()):
+		var dist: float = _color_distance_transparency(target, color_list[i])
+		if dist < best_dist:
+			best_dist = dist
+			best_idx = i
+	if best_idx < 0:
+		return {"found": false, "color": Color(0, 0, 0, 1), "distance": INF}
+	return {"found": true, "color": color_list[best_idx], "distance": best_dist}
 
 
 func _should_treat_as_transparent_by_key(c: Color) -> bool:
@@ -2280,7 +2379,7 @@ func _collect_transparent_candidates_for(base_color: Color) -> Array[Color]:
 				var c: Color = source.get_pixel(x, y)
 				if c.a < 0.1:
 					continue
-				if _color_distance_weighted(c, base_color) <= threshold and not _is_color_in_array(c, result):
+				if _color_distance_transparency(c, base_color) <= threshold and not _is_color_in_array(c, result):
 					result.append(c)
 	return result
 
@@ -2346,9 +2445,18 @@ func _recompute_transparent_collected_colors() -> void:
 	transparent_collected_colors.clear()
 	if not transparent_key_enabled or transparent_manual_colors.is_empty():
 		return
+	var source: Image = _load_active_limited_base_resized_image()
+	var source_unique_colors: Array[Color] = _collect_unique_opaque_colors(source)
 	for base_color in transparent_manual_colors:
 		if not _is_color_in_array(base_color, transparent_collected_colors):
 			transparent_collected_colors.append(base_color)
+		# Snap to nearest present source color so selecting a palette chip still works
+		# when the exact chip color is not currently present in the image.
+		var nearest_info: Dictionary = _find_nearest_color_in_list(base_color, source_unique_colors)
+		if bool(nearest_info.get("found", false)):
+			var nearest_color: Color = nearest_info.get("color", Color(0, 0, 0, 1)) as Color
+			if not _is_color_in_array(nearest_color, transparent_collected_colors):
+				transparent_collected_colors.append(nearest_color)
 	if transparent_tolerance_percent <= 0.0:
 		return
 	for base_color in transparent_manual_colors:
