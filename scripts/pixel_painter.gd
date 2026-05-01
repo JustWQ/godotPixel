@@ -90,6 +90,10 @@ var original_sprite_sheet_image: Image
 var sprite_sheet_file_dialog: FileDialog
 var output_dir_file_dialog: FileDialog
 var pending_export_kind: int = EXPORT_KIND_NONE
+var pending_export_dir: String = ""
+var export_scale_dialog: ConfirmationDialog
+var export_scale_label: Label
+var export_scale_spinbox: SpinBox
 var frame_split_window: Window
 var frame_rows_label: Label
 var frame_rows_spinbox: SpinBox
@@ -146,6 +150,8 @@ var ui_texts: Dictionary = {
 		"offset_apply_toggle": "应用偏移",
 		"dialog_title": "选择参考图片",
 		"export_dir_title": "选择导出目录",
+		"export_scale_title": "导出倍率",
+		"export_scale_label": "倍率(1-10):",
 		"sheet_dialog_title": "选择序列帧图片",
 		"frame_window_title": "帧分割窗口",
 		"rows": "行:",
@@ -180,6 +186,8 @@ var ui_texts: Dictionary = {
 		"offset_apply_toggle": "ApplyOfs",
 		"dialog_title": "Select Reference Image",
 		"export_dir_title": "Select Export Directory",
+		"export_scale_title": "Export Scale",
+		"export_scale_label": "Scale (1-10):",
 		"sheet_dialog_title": "Select Sprite Sheet",
 		"frame_window_title": "Frame Split",
 		"rows": "Rows:",
@@ -435,6 +443,7 @@ func _setup_toolbar_ui() -> void:
 
 	_setup_reference_file_dialog(toolbar_layer)
 	_setup_output_dir_file_dialog(toolbar_layer)
+	_setup_export_scale_dialog(toolbar_layer)
 	_setup_sprite_sheet_file_dialog(toolbar_layer)
 	_setup_frame_split_window(toolbar_layer)
 	_setup_frame_preview_bar(toolbar_layer)
@@ -1296,12 +1305,14 @@ func _save_canvas_png_to_directory(selected_dir: String) -> void:
 	if selected_dir == "":
 		push_error("导出失败，未选择导出目录。")
 		return
+	var scale: int = _get_export_scale_value()
 	var img: Image = _build_canvas_image()
+	img = _build_scaled_image_for_export(img, scale)
 	var stamp := Time.get_datetime_string_from_system().replace(":", "-").replace(" ", "_")
 	var save_path := "%s/pixel_art_%s.png" % [selected_dir.trim_suffix("/").trim_suffix("\\"), stamp]
 	var result := img.save_png(save_path)
 	if result == OK:
-		print("导出成功: %s" % save_path)
+		print("导出成功: %s (scale=%dx)" % [save_path, scale])
 	else:
 		push_error("导出失败，错误码: %s" % str(result))
 
@@ -1319,12 +1330,10 @@ func _save_composed_sheet_png_to_directory(selected_dir: String) -> void:
 		_commit_current_canvas_to_active_source()
 
 	var frame_count: int = frame_rects.size()
-	var cell_w: int = 1
-	var cell_h: int = 1
-	for rect_any in frame_rects:
-		var rect: Rect2i = rect_any as Rect2i
-		cell_w = max(cell_w, rect.size.x)
-		cell_h = max(cell_h, rect.size.y)
+	var scale: int = _get_export_scale_value()
+	# Compose sheet using current canvas grid resolution, not original source rect size.
+	var cell_w: int = max(1, grid_width)
+	var cell_h: int = max(1, grid_height)
 
 	var cols: int = maxi(1, int(ceili(sqrt(float(frame_count)))))
 	var rows: int = int(ceili(float(frame_count) / float(cols)))
@@ -1336,19 +1345,21 @@ func _save_composed_sheet_png_to_directory(selected_dir: String) -> void:
 	for i in range(frame_count):
 		var src_rect: Rect2i = frame_rects[i]
 		var src_img: Image = sprite_sheet_image.get_region(src_rect)
+		src_img.resize(cell_w, cell_h, Image.INTERPOLATE_NEAREST)
 		var col: int = i % cols
 		var row: int = i / cols
 		var dst_x0: int = col * cell_w
 		var dst_y0: int = row * cell_h
-		for y in range(src_img.get_height()):
-			for x in range(src_img.get_width()):
+		for y in range(cell_h):
+			for x in range(cell_w):
 				out_img.set_pixel(dst_x0 + x, dst_y0 + y, src_img.get_pixel(x, y))
 
+	out_img = _build_scaled_image_for_export(out_img, scale)
 	var stamp := Time.get_datetime_string_from_system().replace(":", "-").replace(" ", "_")
 	var save_path := "%s/frame_sheet_%s.png" % [selected_dir.trim_suffix("/").trim_suffix("\\"), stamp]
 	var result: int = out_img.save_png(save_path)
 	if result == OK:
-		print("整图生成成功: %s (frames=%d, grid=%dx%d, cell=%dx%d)" % [save_path, frame_count, cols, rows, cell_w, cell_h])
+		print("整图生成成功: %s (frames=%d, grid=%dx%d, cell=%dx%d, scale=%dx)" % [save_path, frame_count, cols, rows, cell_w, cell_h, scale])
 	else:
 		push_error("整图生成失败，错误码: %s" % str(result))
 
@@ -1473,6 +1484,7 @@ func _request_export_directory(export_kind: int) -> void:
 		push_error("导出目录选择框未初始化。")
 		return
 	pending_export_kind = export_kind
+	pending_export_dir = ""
 	output_dir_file_dialog.popup_centered_ratio(0.7)
 
 
@@ -1496,23 +1508,89 @@ func _setup_output_dir_file_dialog(parent_node: Node) -> void:
 	_update_output_dir_dialog_text()
 
 
+func _setup_export_scale_dialog(parent_node: Node) -> void:
+	export_scale_dialog = ConfirmationDialog.new()
+	export_scale_dialog.confirmed.connect(_on_export_scale_confirmed)
+	export_scale_dialog.canceled.connect(_on_export_scale_canceled)
+	parent_node.add_child(export_scale_dialog)
+
+	var root := VBoxContainer.new()
+	root.add_theme_constant_override("separation", 6)
+	export_scale_dialog.add_child(root)
+
+	export_scale_label = Label.new()
+	root.add_child(export_scale_label)
+
+	export_scale_spinbox = SpinBox.new()
+	export_scale_spinbox.custom_minimum_size = Vector2(120, 0)
+	export_scale_spinbox.min_value = 1
+	export_scale_spinbox.max_value = 10
+	export_scale_spinbox.step = 1
+	export_scale_spinbox.value = 1
+	export_scale_spinbox.allow_lesser = false
+	export_scale_spinbox.allow_greater = false
+	export_scale_spinbox.editable = true
+	root.add_child(export_scale_spinbox)
+
+	_update_export_scale_dialog_text()
+
+
 func _on_output_dir_selected(path: String) -> void:
 	var selected_path: String = path
 	if selected_path == "":
 		push_error("导出失败，未选择有效目录。")
 		pending_export_kind = EXPORT_KIND_NONE
+		pending_export_dir = ""
+		return
+	pending_export_dir = selected_path
+	if export_scale_dialog == null:
+		_on_export_scale_confirmed()
+		return
+	if export_scale_spinbox != null:
+		export_scale_spinbox.value = 1
+	export_scale_dialog.popup_centered_clamped(Vector2(280, 120))
+
+
+func _on_export_scale_confirmed() -> void:
+	if pending_export_dir == "":
+		push_error("导出失败，未选择有效目录。")
+		pending_export_kind = EXPORT_KIND_NONE
 		return
 	match pending_export_kind:
 		EXPORT_KIND_CANVAS:
-			_save_canvas_png_to_directory(selected_path)
+			_save_canvas_png_to_directory(pending_export_dir)
 		EXPORT_KIND_SHEET:
-			_save_composed_sheet_png_to_directory(selected_path)
+			_save_composed_sheet_png_to_directory(pending_export_dir)
 		_:
 			push_error("导出失败，未知导出类型。")
 	pending_export_kind = EXPORT_KIND_NONE
+	pending_export_dir = ""
+
+
+func _on_export_scale_canceled() -> void:
+	pending_export_kind = EXPORT_KIND_NONE
+	pending_export_dir = ""
+
+
+func _get_export_scale_value() -> int:
+	if export_scale_spinbox == null:
+		return 1
+	return clampi(int(export_scale_spinbox.value), 1, 10)
+
+
+func _build_scaled_image_for_export(source: Image, scale: int) -> Image:
+	if source == null:
+		return null
+	var clamped_scale: int = clampi(scale, 1, 10)
+	if clamped_scale <= 1:
+		return source
+	var out: Image = source.duplicate()
+	out.resize(source.get_width() * clamped_scale, source.get_height() * clamped_scale, Image.INTERPOLATE_NEAREST)
+	return out
 
 
 func _setup_sprite_sheet_file_dialog(parent_node: Node) -> void:
+
 	sprite_sheet_file_dialog = FileDialog.new()
 	sprite_sheet_file_dialog.file_mode = FileDialog.FILE_MODE_OPEN_FILE
 	sprite_sheet_file_dialog.access = FileDialog.ACCESS_FILESYSTEM
@@ -1766,6 +1844,7 @@ func _apply_ui_language() -> void:
 	_update_offset_toggle_button_text()
 	_update_reference_dialog_text()
 	_update_output_dir_dialog_text()
+	_update_export_scale_dialog_text()
 	_update_sprite_sheet_dialog_text()
 	_update_frame_window_text()
 	_refresh_transparent_panel_ui()
@@ -1803,6 +1882,14 @@ func _update_output_dir_dialog_text() -> void:
 		return
 	output_dir_file_dialog.title = _ui_text("export_dir_title")
 	output_dir_file_dialog.current_dir = ProjectSettings.globalize_path(DEFAULT_OUTPUT_DIR)
+
+
+func _update_export_scale_dialog_text() -> void:
+	if export_scale_dialog == null:
+		return
+	export_scale_dialog.title = _ui_text("export_scale_title")
+	if export_scale_label != null:
+		export_scale_label.text = _ui_text("export_scale_label")
 
 
 func _update_sprite_sheet_dialog_text() -> void:
