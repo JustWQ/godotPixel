@@ -6,6 +6,8 @@ const DEFAULT_OUTPUT_DIR := "res://output"
 const EXPORT_KIND_NONE := 0
 const EXPORT_KIND_CANVAS := 1
 const EXPORT_KIND_SHEET := 2
+const FRAME_MENU_RESELECT := 1
+const FRAME_MENU_SET_OFFSET_BASE := 2
 const IMAGE_PIXEL_PRESET_NAME := "此图像素"
 const LANG_ZH := "zh"
 const LANG_EN := "en"
@@ -108,7 +110,10 @@ var frame_selection_overlay: ColorRect
 var frame_preview_bar: PanelContainer
 var frame_preview_scroll: ScrollContainer
 var frame_preview_hbox: HBoxContainer
+var frame_thumb_context_menu: PopupMenu
+var frame_thumb_context_frame_index: int = -1
 var frame_offset_target_frame_index: int = -1
+var frame_offset_base_frame_index: int = -1
 var frame_offset_mode_active: bool = false
 var frame_offset_pixels: Vector2i = Vector2i.ZERO
 var frame_offset_dragging: bool = false
@@ -159,6 +164,8 @@ var ui_texts: Dictionary = {
 		"apply_grid": "应用网格切割",
 		"single_frame": "单帧",
 		"crop_image": "裁剪图片",
+		"frame_menu_reselect": "重新框选帧",
+		"frame_menu_set_offset_base": "设为偏移基准帧",
 		"start_hint": "像素画工具已启动。左键上色，右键擦除，中键拖动画布，滚轮缩放，数字键 1-9 选色，C 清空，E 或按钮导出 PNG。"
 	},
 	LANG_EN: {
@@ -195,6 +202,8 @@ var ui_texts: Dictionary = {
 		"apply_grid": "Apply Grid",
 		"single_frame": "Single",
 		"crop_image": "Crop Image",
+		"frame_menu_reselect": "Reselect Frame",
+		"frame_menu_set_offset_base": "Set Offset Base",
 		"start_hint": "Pixel painter ready. Left paint, right erase, middle drag, wheel zoom, 1-9 pick color, C clear, E export PNG."
 	}
 }
@@ -541,6 +550,7 @@ func _draw_canvas() -> void:
 	if frame_offset_mode_active:
 		var overlay_origin: Vector2 = draw_origin + Vector2(float(frame_offset_pixels.x) * scaled_cell_size, float(frame_offset_pixels.y) * scaled_cell_size)
 		var overlay_rect := Rect2(overlay_origin, canvas_size)
+		_draw_offset_base_frame_preview(overlay_origin, scaled_cell_size)
 		draw_rect(overlay_rect, Color(0.2, 1.0, 0.25, 0.22), true)
 		var overlay_line_width: float = maxf(1.0, canvas_zoom * 0.7)
 		for oy in range(grid_height + 1):
@@ -981,6 +991,8 @@ func _on_offset_toggle_pressed() -> void:
 			push_error("请先在底部预览中左键选中一个帧。")
 			return
 		frame_offset_target_frame_index = selected_preview_frame_index
+		if frame_offset_base_frame_index < 0 or frame_offset_base_frame_index >= frame_rects.size():
+			frame_offset_base_frame_index = frame_offset_target_frame_index
 		frame_offset_pixels = Vector2i.ZERO
 		frame_offset_dragging = false
 		frame_offset_mode_active = true
@@ -1015,6 +1027,7 @@ func _on_sprite_sheet_selected(path: String) -> void:
 	frame_offset_mode_active = false
 	frame_offset_pixels = Vector2i.ZERO
 	frame_offset_target_frame_index = -1
+	frame_offset_base_frame_index = -1
 	_update_offset_toggle_button_text()
 	_apply_grid_split_to_frames()
 	_open_frame_split_window(-1)
@@ -1146,8 +1159,7 @@ func _on_frame_thumb_gui_input(event: InputEvent, frame_index: int) -> void:
 		if mb.button_index == MOUSE_BUTTON_LEFT:
 			_load_frame_to_canvas(frame_index)
 		elif mb.button_index == MOUSE_BUTTON_RIGHT:
-			_refresh_frame_preview_strip()
-			_open_frame_split_window(frame_index)
+			_show_frame_thumb_context_menu(frame_index)
 
 
 func _select_preview_frame_by_offset(step: int) -> void:
@@ -1718,6 +1730,10 @@ func _setup_frame_preview_bar(parent_node: Node) -> void:
 	frame_preview_scroll.add_child(frame_preview_hbox)
 	frame_preview_bar.visible = false
 
+	frame_thumb_context_menu = PopupMenu.new()
+	frame_thumb_context_menu.id_pressed.connect(_on_frame_thumb_context_menu_id_pressed)
+	parent_node.add_child(frame_thumb_context_menu)
+
 
 func _setup_transparent_side_panel(parent_node: Node) -> void:
 	transparent_side_panel = PanelContainer.new()
@@ -1991,6 +2007,8 @@ func _apply_grid_split_to_frames() -> void:
 		frame_offset_mode_active = false
 		frame_offset_pixels = Vector2i.ZERO
 		_update_offset_toggle_button_text()
+	if frame_offset_base_frame_index < 0 or frame_offset_base_frame_index >= frame_rects.size():
+		frame_offset_base_frame_index = -1
 	_refresh_frame_grid_overlay()
 	_refresh_frame_preview_strip()
 
@@ -2140,6 +2158,54 @@ func _build_frame_thumb_style(selected: bool) -> StyleBoxFlat:
 	else:
 		style.border_color = Color(0.25, 0.25, 0.25, 1.0)
 	return style
+
+
+func _show_frame_thumb_context_menu(frame_index: int) -> void:
+	if frame_thumb_context_menu == null:
+		return
+	frame_thumb_context_frame_index = frame_index
+	frame_thumb_context_menu.clear()
+	frame_thumb_context_menu.add_item(_ui_text("frame_menu_reselect"), FRAME_MENU_RESELECT)
+	frame_thumb_context_menu.add_item(_ui_text("frame_menu_set_offset_base"), FRAME_MENU_SET_OFFSET_BASE)
+	var popup_pos: Vector2i = Vector2i(get_viewport().get_mouse_position())
+	frame_thumb_context_menu.popup(Rect2i(popup_pos, Vector2i(1, 1)))
+
+
+func _on_frame_thumb_context_menu_id_pressed(id: int) -> void:
+	if frame_thumb_context_frame_index < 0 or frame_thumb_context_frame_index >= frame_rects.size():
+		return
+	match id:
+		FRAME_MENU_RESELECT:
+			_refresh_frame_preview_strip()
+			_open_frame_split_window(frame_thumb_context_frame_index)
+		FRAME_MENU_SET_OFFSET_BASE:
+			frame_offset_base_frame_index = frame_thumb_context_frame_index
+			queue_redraw()
+			print("偏移基准帧已设置: #%d" % frame_offset_base_frame_index)
+
+
+func _draw_offset_base_frame_preview(overlay_origin: Vector2, scaled_cell_size: float) -> void:
+	if sprite_sheet_image == null:
+		return
+	if frame_offset_base_frame_index < 0 or frame_offset_base_frame_index >= frame_rects.size():
+		return
+	if scaled_cell_size <= 0.0:
+		return
+	var base_rect: Rect2i = frame_rects[frame_offset_base_frame_index]
+	var base_img: Image = sprite_sheet_image.get_region(base_rect)
+	base_img.resize(grid_width, grid_height, Image.INTERPOLATE_NEAREST)
+	var alpha_scale: float = 0.42
+	for y in range(grid_height):
+		for x in range(grid_width):
+			var c: Color = base_img.get_pixel(x, y)
+			if c.a <= 0.01:
+				continue
+			var draw_color: Color = Color(c.r, c.g, c.b, c.a * alpha_scale)
+			var rect := Rect2(
+				overlay_origin + Vector2(float(x) * scaled_cell_size, float(y) * scaled_cell_size),
+				Vector2(scaled_cell_size, scaled_cell_size)
+			)
+			draw_rect(rect, draw_color, true)
 
 
 func _refresh_frame_grid_overlay() -> void:
